@@ -113,6 +113,7 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     int H,
     int N,
     int64_t const* cu_seqlens,
+    VarlenMetadata varlen_metadata,
     int total_tiles,
     float const* A_log_ptr,
     float gate_scale
@@ -151,21 +152,33 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     int seq_len, t_tiles_this_seq;
 
     if constexpr (IsVarlen) {
-        // Linear scan on cu_seqlens to find (seq_idx, local_t)
-        seq_idx = 0;
-        tiles_before = 0;
-        for (int i = 0; i < N; i++) {
-            int slen = int(cu_seqlens[i + 1] - cu_seqlens[i]);
-            int n_tiles = (slen + CHUNK - 1) / CHUNK;
-            if (tiles_before + n_tiles > global_tile_idx) {
-                seq_idx = i;
-                break;
+        if (varlen_metadata.enabled()) {
+            int actual_total_tiles = varlen_metadata.chunk_offsets[N];
+            if (global_tile_idx >= actual_total_tiles) return;
+
+            int2 chunk_meta = varlen_metadata.chunk_indices[global_tile_idx];
+            seq_idx = chunk_meta.x;
+            local_t = chunk_meta.y;
+            tiles_before = varlen_metadata.chunk_offsets[seq_idx];
+            bos = cu_seqlens[seq_idx];
+            eos = cu_seqlens[seq_idx + 1];
+        } else {
+            // Linear scan on cu_seqlens to find (seq_idx, local_t)
+            seq_idx = 0;
+            tiles_before = 0;
+            for (int i = 0; i < N; i++) {
+                int slen = int(cu_seqlens[i + 1] - cu_seqlens[i]);
+                int n_tiles = (slen + CHUNK - 1) / CHUNK;
+                if (tiles_before + n_tiles > global_tile_idx) {
+                    seq_idx = i;
+                    break;
+                }
+                tiles_before += n_tiles;
             }
-            tiles_before += n_tiles;
+            local_t = global_tile_idx - tiles_before;
+            bos = cu_seqlens[seq_idx];
+            eos = cu_seqlens[seq_idx + 1];
         }
-        local_t = global_tile_idx - tiles_before;
-        bos = cu_seqlens[seq_idx];
-        eos = cu_seqlens[seq_idx + 1];
     } else {
         int T_seq = T_total / N;
         int tiles_per_seq = (T_seq + CHUNK - 1) / CHUNK;

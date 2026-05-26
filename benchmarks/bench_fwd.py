@@ -30,7 +30,14 @@ def bench_fn(fn, warmup, iters, repeats):
     return mean, mn, mx
 
 
-def run_case(seq_lens, H, D, warmup, iters, repeats):
+def format_seq_lens(seq_lens):
+    if len(seq_lens) > 4 and len(set(seq_lens)) == 1:
+        return f"[{seq_lens[0]}] * {len(seq_lens)}"
+    return str(seq_lens)
+
+
+def run_case(seq_lens, H, D, warmup, iters, repeats, varlen_metadata_label,
+             use_varlen_metadata):
     device = torch.device("cuda")
     LOWER_BOUND = -5.0
     scale_float = 1.0 / math.sqrt(D)
@@ -38,17 +45,22 @@ def run_case(seq_lens, H, D, warmup, iters, repeats):
     varlen = len(seq_lens) > 1
     T_total = sum(seq_lens)
     N = len(seq_lens)
+    cu_seqlens = None
 
     if varlen:
         cu_seqlens = torch.tensor(
             [0] + list(torch.cumsum(torch.tensor(seq_lens), dim=0).tolist()),
             dtype=torch.long, device=device,
         )
-        print(f"varlen shape=[{T_total},{H},{D}] seq_lens={seq_lens} warmup={warmup} iters={iters} repeats={repeats}")
-        extra = {"cu_seqlens": cu_seqlens}
+        print(
+            f"varlen shape=[{T_total},{H},{D}] seq_lens={format_seq_lens(seq_lens)} "
+            f"use_varlen_metadata={varlen_metadata_label} warmup={warmup} "
+            f"iters={iters} repeats={repeats}"
+        )
     else:
         print(f"shape=[{T_total},{H},{D}] warmup={warmup} iters={iters} repeats={repeats}")
-        extra = {}
+
+    varlen_kwargs = {"cu_seqlens": cu_seqlens} if varlen else {}
 
     q = F.normalize(torch.randn((1, T_total, H, D), dtype=torch.float32, device=device), p=2, dim=-1).to(torch.bfloat16)
     k = F.normalize(torch.randn((1, T_total, H, D), dtype=torch.float32, device=device), p=2, dim=-1).to(torch.bfloat16)
@@ -67,7 +79,9 @@ def run_case(seq_lens, H, D, warmup, iters, repeats):
     def run_flash_kda():
         flash_kda.fwd(q, k, v, g, beta, scale, out,
                       A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
-                      initial_state=initial_state, final_state=final_state, **extra)
+                      initial_state=initial_state, final_state=final_state,
+                      cu_seqlens=cu_seqlens,
+                      use_varlen_metadata=use_varlen_metadata)
 
     mean, mn, mx = bench_fn(run_flash_kda, warmup, iters, repeats)
     print(f"  flash_kda (bf16 state) : mean={mean:.4f} ms, min={mn:.4f} ms, max={mx:.4f} ms")
@@ -75,7 +89,9 @@ def run_case(seq_lens, H, D, warmup, iters, repeats):
     # --- flash_kda: no state ---
     def run_flash_kda_no_state():
         flash_kda.fwd(q, k, v, g, beta, scale, out,
-                      A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND, **extra)
+                      A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
+                      cu_seqlens=cu_seqlens,
+                      use_varlen_metadata=use_varlen_metadata)
 
     mean, mn, mx = bench_fn(run_flash_kda_no_state, warmup, iters, repeats)
     print(f"  flash_kda (no state)   : mean={mean:.4f} ms, min={mn:.4f} ms, max={mx:.4f} ms")
@@ -87,7 +103,9 @@ def run_case(seq_lens, H, D, warmup, iters, repeats):
     def run_flash_kda_fp32():
         flash_kda.fwd(q, k, v, g, beta, scale, out,
                       A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
-                      initial_state=initial_state_fp32, final_state=final_state_fp32, **extra)
+                      initial_state=initial_state_fp32, final_state=final_state_fp32,
+                      cu_seqlens=cu_seqlens,
+                      use_varlen_metadata=use_varlen_metadata)
 
     mean, mn, mx = bench_fn(run_flash_kda_fp32, warmup, iters, repeats)
     print(f"  flash_kda (fp32 state) : mean={mean:.4f} ms, min={mn:.4f} ms, max={mx:.4f} ms")
@@ -107,7 +125,7 @@ def run_case(seq_lens, H, D, warmup, iters, repeats):
             A_log=A_log, dt_bias=dt_bias,
             lower_bound=LOWER_BOUND,
             transpose_state_layout=True,
-            **extra,
+            **varlen_kwargs,
         )
 
     mean, mn, mx = bench_fn(run_chunk_kda, warmup, iters, repeats)
@@ -125,7 +143,7 @@ def run_case(seq_lens, H, D, warmup, iters, repeats):
             output_final_state=True,
             use_qk_l2norm_in_kernel=True,
             transpose_state_layout=True,
-            **extra,
+            **varlen_kwargs,
         )
 
     mean, mn, mx = bench_fn(run_chunk_gated_delta_rule, warmup, iters, repeats)
@@ -139,7 +157,20 @@ FIXED_CASES = [
 VARLEN_CASES = [
     [1300, 547, 2048, 963, 271, 3063],
     [1024] * 8,
+    # Same total token count, increasing sequence count. This surfaces the
+    # cost of repeated varlen tile lookups.
+    [512] * 16,
+    [256] * 32,
+    [64] * 128,
+    [32] * 256,
+    [16] * 512,
 ]
+
+VARLEN_METADATA_OPTIONS = {
+    "default": None,
+    "on": True,
+    "off": False,
+}
 
 
 def main():
@@ -151,6 +182,7 @@ def main():
     p.add_argument("--mode", choices=["fixed", "varlen", "all"], default="all")
     p.add_argument("--H", type=int, default=96)
     p.add_argument("--D", type=int, default=128)
+    p.add_argument("--use-varlen-metadata", choices=["default", "on", "off"], default="default")
     args = p.parse_args()
 
     cases = []
@@ -160,7 +192,9 @@ def main():
         cases.extend(VARLEN_CASES)
 
     for seq_lens in cases:
-        run_case(seq_lens, args.H, args.D, args.warmup, args.iters, args.repeats)
+        run_case(seq_lens, args.H, args.D, args.warmup, args.iters, args.repeats,
+                 args.use_varlen_metadata,
+                 VARLEN_METADATA_OPTIONS[args.use_varlen_metadata])
 
 
 if __name__ == "__main__":

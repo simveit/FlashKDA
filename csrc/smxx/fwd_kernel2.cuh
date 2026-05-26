@@ -147,6 +147,7 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
     int H,
     int N,
     int64_t const* cu_seqlens,
+    VarlenMetadata varlen_metadata,
     int total_tiles
 ) {
     using BF16 = cutlass::bfloat16_t;
@@ -221,10 +222,14 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
     if constexpr (IsVarlen) {
         bos = cu_seqlens[seq_idx];
         eos = cu_seqlens[seq_idx + 1];
-        // Compute tile_base via linear scan (no host-precomputed table)
-        tile_base = 0;
-        for (int i = 0; i < seq_idx; i++) {
-            tile_base += (int(cu_seqlens[i + 1] - cu_seqlens[i]) + CHUNK - 1) / CHUNK;
+        if (varlen_metadata.enabled()) {
+            tile_base = varlen_metadata.chunk_offsets[seq_idx];
+        } else {
+            // Compute tile_base via linear scan when metadata is not available.
+            tile_base = 0;
+            for (int i = 0; i < seq_idx; i++) {
+                tile_base += (int(cu_seqlens[i + 1] - cu_seqlens[i]) + CHUNK - 1) / CHUNK;
+            }
         }
     } else {
         int T_seq = T_total / N;

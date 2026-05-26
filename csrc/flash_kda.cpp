@@ -36,7 +36,8 @@ void fwd(
     double lower_bound,
     std::optional<torch::Tensor> initial_state = std::nullopt,
     std::optional<torch::Tensor> final_state = std::nullopt,
-    std::optional<torch::Tensor> cu_seqlens = std::nullopt
+    std::optional<torch::Tensor> cu_seqlens = std::nullopt,
+    std::optional<bool> use_varlen_metadata = std::nullopt
 ) {
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && g.is_cuda() && beta.is_cuda() && out.is_cuda() && workspace.is_cuda(),
                 "all tensors must be on CUDA");
@@ -177,6 +178,20 @@ void fwd(
         total_tiles = int(N_val * ((T_seq + CHUNK - 1) / CHUNK));   // exact for batched
     }
 
+    torch::Tensor chunk_indices_t;
+    torch::Tensor chunk_offsets_t;
+    VarlenMetadata varlen_metadata;
+    bool build_varlen_metadata = is_varlen && use_varlen_metadata.value_or(
+        N_val >= kVarlenMetadataAutoMinSequences);
+
+    if (build_varlen_metadata) {
+        auto meta_options = q.options().dtype(torch::kInt32);
+        chunk_indices_t = torch::empty({total_tiles, 2}, meta_options);
+        chunk_offsets_t = torch::empty({N_val + 1}, meta_options);
+        varlen_metadata.chunk_indices = reinterpret_cast<int2*>(chunk_indices_t.data_ptr<int32_t>());
+        varlen_metadata.chunk_offsets = chunk_offsets_t.data_ptr<int32_t>();
+    }
+
     // Dispatch based on state configuration and varlen
     #define LAUNCH(HI, HO, FP32, VL) \
         launch_fwd<128, HI, HO, FP32, VL>( \
@@ -184,6 +199,7 @@ void fwd(
             initial_state_raw, scale_f, final_state_raw, out_ptr, \
             workspace_ptr, total_tiles, \
             int(T_total), int(H), int(N_val), cu_seqlens_dev, \
+            varlen_metadata, \
             A_log_ptr, dt_bias_ptr, gate_scale, stream)
 
     #define DISPATCH_STATE(VL) \
@@ -220,7 +236,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("workspace"),
         py::arg("A_log"), py::arg("dt_bias"), py::arg("lower_bound"),
         py::arg("initial_state") = py::none(), py::arg("final_state") = py::none(),
-        py::arg("cu_seqlens") = py::none());
+        py::arg("cu_seqlens") = py::none(),
+        py::arg("use_varlen_metadata") = py::none());
     m.def("get_workspace_size",
         static_cast<int64_t(*)(int64_t, int64_t, int64_t)>(&get_workspace_size),
         "Get workspace size in bytes",

@@ -312,6 +312,80 @@ def test_fwd_varlen():
     print("Success: varlen kernel == torch ref (exact match)")
 
 
+def test_fwd_varlen_metadata_paths():
+    """Test: metadata and fallback varlen paths produce the same result."""
+    H, D = 1, 128
+    LOWER_BOUND = -5.0
+    seq_lens = [17] * 32
+    T_total = sum(seq_lens)
+    N = len(seq_lens)
+    cu_seqlens = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(seq_lens), dim=0).tolist()),
+        dtype=torch.long, device='cuda',
+    )
+
+    torch.manual_seed(1)
+    q = F.normalize(torch.randn((1, T_total, H, D), dtype=torch.float32, device='cuda'), p=2, dim=-1).to(torch.bfloat16)
+    k = F.normalize(torch.randn((1, T_total, H, D), dtype=torch.float32, device='cuda'), p=2, dim=-1).to(torch.bfloat16)
+    v = torch.randn((1, T_total, H, D), dtype=torch.bfloat16, device='cuda')
+    g = torch.randn((1, T_total, H, D), dtype=torch.bfloat16, device='cuda')
+    beta = torch.randn((1, T_total, H), dtype=torch.bfloat16, device='cuda')
+    A_log = torch.rand(H, dtype=torch.float32, device='cuda')
+    dt_bias = torch.rand(H, D, dtype=torch.float32, device='cuda')
+    initial_state = torch.randn((N, H, D, D), dtype=torch.bfloat16, device='cuda')
+    scale = 1.0 / math.sqrt(D)
+
+    out_metadata = torch.zeros_like(q)
+    final_metadata = torch.zeros_like(initial_state)
+    flash_kda.fwd(q, k, v, g, beta, scale, out_metadata,
+                  A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
+                  initial_state=initial_state.clone(), final_state=final_metadata,
+                  cu_seqlens=cu_seqlens, use_varlen_metadata=True)
+
+    out_scan = torch.zeros_like(q)
+    final_scan = torch.zeros_like(initial_state)
+    flash_kda.fwd(q, k, v, g, beta, scale, out_scan,
+                  A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
+                  initial_state=initial_state.clone(), final_state=final_scan,
+                  cu_seqlens=cu_seqlens, use_varlen_metadata=False)
+    torch.cuda.synchronize()
+
+    assert torch.equal(out_metadata, out_scan), "metadata and scan outputs differ"
+    assert torch.equal(final_metadata, final_scan), "metadata and scan final states differ"
+
+
+def test_fwd_varlen_metadata_large_n():
+    """Test: metadata handles sequence counts larger than one CTA."""
+    H, D = 1, 128
+    LOWER_BOUND = -5.0
+    seq_lens = [1] * 257
+    T_total = sum(seq_lens)
+    cu_seqlens = torch.arange(0, T_total + 1, dtype=torch.long, device='cuda')
+
+    torch.manual_seed(2)
+    q = F.normalize(torch.randn((1, T_total, H, D), dtype=torch.float32, device='cuda'), p=2, dim=-1).to(torch.bfloat16)
+    k = F.normalize(torch.randn((1, T_total, H, D), dtype=torch.float32, device='cuda'), p=2, dim=-1).to(torch.bfloat16)
+    v = torch.randn((1, T_total, H, D), dtype=torch.bfloat16, device='cuda')
+    g = torch.randn((1, T_total, H, D), dtype=torch.bfloat16, device='cuda')
+    beta = torch.randn((1, T_total, H), dtype=torch.bfloat16, device='cuda')
+    A_log = torch.rand(H, dtype=torch.float32, device='cuda')
+    dt_bias = torch.rand(H, D, dtype=torch.float32, device='cuda')
+    scale = 1.0 / math.sqrt(D)
+
+    out_kernel = torch.zeros_like(q)
+    flash_kda.fwd(q, k, v, g, beta, scale, out_kernel,
+                  A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
+                  cu_seqlens=cu_seqlens, use_varlen_metadata=True)
+    torch.cuda.synchronize()
+
+    out_ref = torch.zeros_like(q)
+    torch_ref(q, k, v, g, beta, scale, out_ref,
+              A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
+              cu_seqlens=cu_seqlens)
+
+    assert torch.equal(out_kernel, out_ref), "fallback output mismatch between kernel and torch ref"
+
+
 @torch.inference_mode()
 def test_fwd_vs_fla():
     from fla.utils import assert_close, device
