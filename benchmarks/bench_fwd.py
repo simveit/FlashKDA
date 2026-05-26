@@ -33,6 +33,8 @@ def bench_fn(fn, warmup, iters, repeats):
 def format_seq_lens(seq_lens):
     if len(seq_lens) > 4 and len(set(seq_lens)) == 1:
         return f"[{seq_lens[0]}] * {len(seq_lens)}"
+    if len(seq_lens) > 4 and len(set(seq_lens[1:])) == 1:
+        return f"[{seq_lens[0]}] + [{seq_lens[1]}] * {len(seq_lens) - 1}"
     return str(seq_lens)
 
 
@@ -157,13 +159,12 @@ FIXED_CASES = [
 VARLEN_CASES = [
     [1300, 547, 2048, 963, 271, 3063],
     [1024] * 8,
-    # Same total token count, increasing sequence count. This surfaces the
-    # cost of repeated varlen tile lookups.
     [512] * 16,
     [256] * 32,
     [64] * 128,
     [32] * 256,
     [16] * 512,
+    [4096] + [8] * 512,
 ]
 
 VARLEN_METADATA_OPTIONS = {

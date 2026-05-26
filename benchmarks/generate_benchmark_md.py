@@ -152,6 +152,9 @@ def parse_stdout(text: str) -> list[dict]:
 
 def _fmt_seq_lens(seq_lens_str: str) -> str:
     """Uniform segment lengths become ``1024 x 8``; mixed lists keep the bracket form."""
+    m = re.fullmatch(r"\[(\d+)\]\s*\+\s*\[(\d+)\]\s*\*\s*(\d+)", seq_lens_str)
+    if m:
+        return f"{m.group(1)} + {m.group(2)} x {m.group(3)}"
     m = re.fullmatch(r"\[(\d+)\]\s*\*\s*(\d+)", seq_lens_str)
     if m:
         return f"{m.group(1)} x {m.group(2)}"
