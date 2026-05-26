@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Run ``bench_fwd.py`` twice (default ``H`` and ``--H 64``), parse stdout, and write
-a benchmark markdown report.
+Run ``bench_fwd.py`` for each requested varlen metadata mode at default ``H`` and
+``--H 64``, parse stdout, and write a benchmark markdown report.
 
 Reports mean latency for ``flash_kda (fp32 state)`` and ``fla_chunk_kda`` (FLA
 ``chunk_kda``), plus speedup ``chunk_mean / flash_mean``. Generated date is UTC,
@@ -38,7 +38,8 @@ RE_HEADER_FIXED = re.compile(
     r"^shape=\[(\d+),(\d+),(\d+)\] warmup=(\d+) iters=(\d+) repeats=(\d+)\s*$"
 )
 RE_HEADER_VARLEN = re.compile(
-    r"^varlen shape=\[(\d+),(\d+),(\d+)\] seq_lens=(\[[^\]]+\]) "
+    r"^varlen shape=\[(\d+),(\d+),(\d+)\] seq_lens=(.+?) "
+    r"(?:use_varlen_metadata=(\w+) )?"
     r"warmup=(\d+) iters=(\d+) repeats=(\d+)\s*$"
 )
 RE_RESULT = re.compile(
@@ -102,7 +103,7 @@ def parse_stdout(text: str) -> list[dict]:
         if m:
             if current is not None:
                 cases.append(current)
-            t, h, d, seq_lens, w, it, rep = m.groups()
+            t, h, d, seq_lens, varlen_metadata, w, it, rep = m.groups()
             current = new_case_base(
                 "varlen",
                 T=int(t),
@@ -113,6 +114,7 @@ def parse_stdout(text: str) -> list[dict]:
                 repeats=int(rep),
                 seq_lens=seq_lens,
             )
+            current["varlen_metadata"] = varlen_metadata or "default"
             continue
 
         m = RE_HEADER_FIXED.match(line)
@@ -150,6 +152,9 @@ def parse_stdout(text: str) -> list[dict]:
 
 def _fmt_seq_lens(seq_lens_str: str) -> str:
     """Uniform segment lengths become ``1024 x 8``; mixed lists keep the bracket form."""
+    m = re.fullmatch(r"\[(\d+)\]\s*\*\s*(\d+)", seq_lens_str)
+    if m:
+        return f"{m.group(1)} x {m.group(2)}"
     try:
         xs = ast.literal_eval(seq_lens_str)
     except (ValueError, SyntaxError):
@@ -202,6 +207,24 @@ def _argv_with_h(argv: list[str], h: int) -> list[str]:
     return out
 
 
+def _argv_with_varlen_metadata(argv: list[str], mode: str) -> list[str]:
+    """Drop any ``--use-varlen-metadata`` from *argv*, then append *mode*."""
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--use-varlen-metadata" and i + 1 < len(argv):
+            i += 2
+            continue
+        if a.startswith("--use-varlen-metadata="):
+            i += 1
+            continue
+        out.append(a)
+        i += 1
+    out.extend(["--use-varlen-metadata", mode])
+    return out
+
+
 def _complete_cases(raw: list[dict]) -> list[dict]:
     return [
         c
@@ -236,13 +259,13 @@ def _render_table_block(cases: list[dict]) -> list[str]:
 
 
 def render_markdown(
-    sections: list[list[dict]],
+    sections: list[tuple[str, list[dict]]],
     generated_at: str,
     generator_cmd: str,
     device_label: str,
 ) -> str:
     """
-    *sections*: one ``cases`` list per table (default ``H``, then ``H=64``).
+    *sections*: ``(label, cases)`` pairs, one per table.
     *generator_cmd*: command that reproduces this report.
     *device_label*: device/platform label printed in the report title.
     """
@@ -264,7 +287,7 @@ def render_markdown(
     lines.append(f"- Command: `{generator_cmd}`")
     lines.append("")
 
-    first_cases = next((c for c in sections if c), None)
+    first_cases = next((cases for _label, cases in sections if cases), None)
     c0 = first_cases[0] if first_cases else None
     if c0 is not None:
         lines.append(
@@ -276,11 +299,14 @@ def render_markdown(
         lines.append(FLA_CHUNK_GDN_OPTIONS_MD)
         lines.append("")
 
-    for cases in sections:
+    for label, cases in sections:
         if not cases:
             continue
         c0 = cases[0]
-        lines.append(f"### `T={c0['T']}`, `H={c0['H']}`, `D={c0['D']}`")
+        title = f"`T={c0['T']}`, `H={c0['H']}`, `D={c0['D']}`"
+        if label:
+            title += f", `{label}`"
+        lines.append(f"### {title}")
         lines.append("")
         lines.extend(_render_table_block(cases))
 
@@ -303,7 +329,19 @@ def main() -> None:
         default=DEFAULT_DEVICE_LABEL,
         help=f"Device/platform label for the report title (default: {DEFAULT_DEVICE_LABEL!r})",
     )
+    p.add_argument(
+        "--varlen-metadata-modes",
+        default="default,off,on",
+        help=(
+            "Comma-separated --use-varlen-metadata modes to benchmark "
+            "(default: default,off,on)."
+        ),
+    )
     args, bench_extra = p.parse_known_args()
+    metadata_modes = [m.strip() for m in args.varlen_metadata_modes.split(",") if m.strip()]
+    invalid_modes = sorted(set(metadata_modes) - {"default", "on", "off"})
+    if invalid_modes:
+        p.error(f"invalid --varlen-metadata-modes value(s): {', '.join(invalid_modes)}")
 
     def _fmt_generator_cmd(extra: list[str]) -> str:
         cmd = "python benchmarks/generate_benchmark_md.py"
@@ -311,22 +349,24 @@ def main() -> None:
             cmd += f" -o {args.output}"
         if args.device_label != DEFAULT_DEVICE_LABEL:
             cmd += f" --device-label {args.device_label}"
+        if args.varlen_metadata_modes != "default,off,on":
+            cmd += f" --varlen-metadata-modes {args.varlen_metadata_modes}"
         tail = " ".join(extra)
         return f"{cmd} {tail}".strip() if tail else cmd
 
-    argv_default = list(bench_extra)
-    argv_h64 = _argv_with_h(bench_extra, 64)
+    sections: list[tuple[str, list[dict]]] = []
+    for mode in metadata_modes:
+        argv_mode = _argv_with_varlen_metadata(bench_extra, mode)
+        for h in (None, 64):
+            argv = list(argv_mode) if h is None else _argv_with_h(argv_mode, h)
+            stdout = run_bench(argv)
+            cases = _complete_cases(parse_stdout(stdout))
+            label = f"use_varlen_metadata={mode}"
+            sections.append((label, cases))
 
-    stdout_a = run_bench(argv_default)
-    stdout_b = run_bench(argv_h64)
-    cases_a = _complete_cases(parse_stdout(stdout_a))
-    cases_b = _complete_cases(parse_stdout(stdout_b))
-
-    sections: list[list[dict]] = [cases_a, cases_b]
-
-    if not cases_a or not cases_b:
+    if any(not cases for _label, cases in sections):
         sys.stderr.write(
-            "Warning: missing complete benchmark rows for one or both runs "
+            "Warning: missing complete benchmark rows for one or more runs "
             "(need fp32 state, fla_chunk_kda, and fla_chunk_gated_delta_rule "
             "for each).\n"
         )
